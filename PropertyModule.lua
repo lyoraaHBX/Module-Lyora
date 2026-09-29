@@ -18,10 +18,12 @@ function PropertyModule.Init(Context, PROPERTIES)
 
     local CashPath = {"PlayerGui", "MafiaWarsUI", "Root", "TopBar", "CashCluster", "CashValue"}
 
-    -- BARU: Slot Cap X/Y -> Scroller.Summary.Lots.Value.ContentText (contoh: "10/14")
+    -- REQ #5: "membaca Slot ownednya dengan cara Cari ContentText misal 10/14"
+    -- Path: PlayerGui.MafiaWarsUI.Root.Content.PropsPanel.Scroller.Summary.Lots.Value -> ContentText
     local PropsLotsCapPath = {"PlayerGui", "MafiaWarsUI", "Root", "Content", "PropsPanel", "Scroller", "Summary", "Lots", "Value", "ContentText"}
 
-    -- BARU: Base path semua slot -> YourBlock.Street.Lot_{index}
+    -- Base path dipakai untuk REQ #3 (earn) dan REQ #4 (cek kosong)
+    -- Path dasar: PlayerGui.MafiaWarsUI.Root.Content.PropsPanel.Scroller.YourBlock.Street
     local PropsLotsBasePath = {"PlayerGui", "MafiaWarsUI", "Root", "Content", "PropsPanel", "Scroller", "YourBlock", "Street"}
 
     local PropertyNamesList = {}
@@ -36,6 +38,7 @@ function PropertyModule.Init(Context, PROPERTIES)
     end
 
     -- Cache slot -> propId, dilacak dari hasil buy/delete script sendiri
+    -- (GUI baru tidak menyediakan info "id property" di slot, hanya status kosong & earn)
     local SlotOwnershipCache = {}
 
     local function GetCurrentCash()
@@ -45,7 +48,7 @@ function PropertyModule.Init(Context, PROPERTIES)
         return ParseAbbreviatedNumber(raw)
     end
 
-    -- BARU: Baca X/Y dari Summary.Lots.Value.ContentText
+    -- REQ #5: Baca "10/14" dari Summary.Lots.Value.ContentText
     local function GetPropsCapInfo()
         local node = SafeFindPath(PropsLotsCapPath)
         if not node then return 0, 0 end
@@ -55,7 +58,8 @@ function PropertyModule.Init(Context, PROPERTIES)
         return tonumber(owned) or 0, tonumber(max) or 0
     end
 
-    -- BARU: Cek slot kosong via keberadaan Lot_{index}.ForSale.Plus
+    -- REQ #4: "jika slot kosong ada ForeSale.Plus maka itu slot kosong"
+    -- Path: YourBlock.Street.Lot_{index}.ForSale.Plus
     local function IsSlotEmpty(slotIndex)
         local path = {}
         for _, p in ipairs(PropsLotsBasePath) do table.insert(path, p) end
@@ -64,10 +68,11 @@ function PropertyModule.Init(Context, PROPERTIES)
         table.insert(path, "Plus")
 
         local node = SafeFindPath(path)
-        return node ~= nil
+        return node ~= nil  -- ADA node ForSale.Plus = slot KOSONG
     end
 
-    -- BARU: Baca earn dari Lot_{index}.Chip.Label.ContentText, contoh "$12.09M/hr"
+    -- REQ #3: "melihat earnnya lewat Lot_8.Chip.Label, cara membacanya ContentText $12.09M/hr"
+    -- Path: YourBlock.Street.Lot_{index}.Chip.Label.ContentText
     local function GetEarnForSlot(slotIndex)
         local path = {}
         for _, p in ipairs(PropsLotsBasePath) do table.insert(path, p) end
@@ -82,11 +87,12 @@ function PropertyModule.Init(Context, PROPERTIES)
         local raw = GetRawTextFromNode(node)
         if not raw then return 0 end
 
+        -- Contoh raw: "$12.09M/hr" -> buang "/hr" -> "$12.09M" -> parse jadi angka
         local cleaned = tostring(raw):gsub("/hr", "")
         return ParseAbbreviatedNumber(cleaned) or 0
     end
 
-    -- BARU: Scan 1..maxSlots (bukan lagi loop TileGrid:GetChildren())
+    -- Scan semua slot 1..maxSlots, kembalikan list slot TERISI beserta earn & id (cache, bisa nil)
     local function GetOwnedPropertiesList()
         local _, maxSlots = GetPropsCapInfo()
         local list = {}
@@ -104,7 +110,8 @@ function PropertyModule.Init(Context, PROPERTIES)
         return list
     end
 
-    -- BARU: Cari slot kosong langsung cek GUI (tidak butuh ownedList lagi)
+    -- REQ #1: "perlu checking mana yang kosong Pake number dibelakang Lot_1"
+    -- Loop 1..maxSlots, cek IsSlotEmpty, return index pertama yang kosong
     local function FindNextEmptySlotIndex(maxSlots)
         for i = 1, maxSlots do
             if IsSlotEmpty(i) then
@@ -132,6 +139,7 @@ function PropertyModule.Init(Context, PROPERTIES)
         return 0
     end
 
+    -- REQ #1: BuyProperty(hash, "p_fur", 1) -- "1" = slotIndex hasil FindNextEmptySlotIndex
     local function TryBuyProperty(propId, slotIndex)
         local success, result = pcall(function()
             return BuyPropertyRemote:InvokeServer(PROPERTY_HASH, propId, slotIndex)
@@ -143,6 +151,7 @@ function PropertyModule.Init(Context, PROPERTIES)
         return false, result
     end
 
+    -- REQ #2: DeleteProperty(hash, "p_plantation", 1) -- "1" = slotIndex hasil pencarian earn terendah
     local function TryDeleteProperty(propId, slotIndex)
         local success, result = pcall(function()
             return DeletePropertyRemote:InvokeServer(PROPERTY_HASH, propId, slotIndex)
@@ -198,6 +207,7 @@ function PropertyModule.Init(Context, PROPERTIES)
         end
     })
 
+    -- REQ #1 dalam aksi: isi slot kosong (Lot_N) via buy
     local function RunAutoFillEmptySlots()
         local MAX_BUY_PER_CYCLE = 15
 
@@ -236,6 +246,7 @@ function PropertyModule.Init(Context, PROPERTIES)
         end
     end
 
+    -- REQ #2 & #3 dalam aksi: cari earn terlemah, upgrade sesuai cash
     local function RunAutoUpgradeWeakest()
         local ownedList = GetOwnedPropertiesList()
         if #ownedList == 0 then return end
