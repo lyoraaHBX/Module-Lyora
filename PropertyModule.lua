@@ -97,7 +97,7 @@ function PropertyModule.Init(Context, PROPERTIES)
         return nil
     end
 
-    -- Mengambil daftar Lot yang dimiliki & Lot yang kosong
+    -- Mengambil daftar Lot yang dimiliki & Lot yang kosong (Mengabaikan Lot yang LOCKED)
     local function GetStreetLotsState()
         local streetNode = SafeFindPath(StreetPath)
         if not streetNode then return {}, {} end
@@ -108,32 +108,44 @@ function PropertyModule.Init(Context, PROPERTIES)
         for _, lotNode in ipairs(streetNode:GetChildren()) do
             local lotNum = ExtractLotNumber(lotNode.Name)
             if lotNum then
-                -- Cek apakah Lot ini kosong (ForSale.Plus ada / ForSale Visible)
-                local forSaleNode = lotNode:FindFirstChild("ForSale")
-                local isForSale = forSaleNode and (forSaleNode:FindFirstChild("Plus") or forSaleNode.Visible == true)
+                -- 1. CEK APAKAH LOT DALAM KEADAAN LOCKED (Jika locked, abaikan total)
+                local lockedNode = lotNode:FindFirstChild("Locked")
+                local isLocked = lockedNode and (
+                    (lockedNode:IsA("GuiObject") and lockedNode.Visible == true) or
+                    (not lockedNode:IsA("GuiObject"))
+                )
 
-                if isForSale then
-                    table.insert(emptyLotNumbers, lotNum)
-                else
-                    -- Lot Terisi
-                    local chipLabel = lotNode:FindFirstChild("Chip") and lotNode.Chip:FindFirstChild("Label")
-                    local earnValue = 0
+                if not isLocked then
+                    -- 2. CEK APAKAH LOT KOSONG (ForSale.Plus ada / ForSale Visible)
+                    local forSaleNode = lotNode:FindFirstChild("ForSale")
+                    local isForSale = forSaleNode and (
+                        (forSaleNode:IsA("GuiObject") and forSaleNode.Visible == true) or
+                        forSaleNode:FindFirstChild("Plus") ~= nil
+                    )
 
-                    if chipLabel then
-                        local rawText = GetRawTextFromNode(chipLabel)
-                        -- Pembersihan string: "$12.09M/hr" -> "12.09M"
-                        local cleanText = string.gsub(tostring(rawText), "[%$%s/hrHRhH]", "")
-                        earnValue = ParseAbbreviatedNumber(cleanText)
+                    if isForSale then
+                        table.insert(emptyLotNumbers, lotNum)
+                    else
+                        -- 3. LOT TERISI (OWNED)
+                        local chipLabel = lotNode:FindFirstChild("Chip") and lotNode.Chip:FindFirstChild("Label")
+                        local earnValue = 0
+
+                        if chipLabel then
+                            local rawText = GetRawTextFromNode(chipLabel)
+                            -- Format teks misal "$12.09M/hr" -> "12.09M"
+                            local cleanText = string.gsub(tostring(rawText), "[%$%s/hrHRhH]", "")
+                            earnValue = ParseAbbreviatedNumber(cleanText)
+                        end
+
+                        local propId = DetectPropertyIdFromLot(lotNode)
+
+                        table.insert(ownedList, {
+                            id = propId,
+                            lotNumber = lotNum,
+                            earn = earnValue,
+                            node = lotNode
+                        })
                     end
-
-                    local propId = DetectPropertyIdFromLot(lotNode)
-
-                    table.insert(ownedList, {
-                        id = propId,
-                        lotNumber = lotNum,
-                        earn = earnValue,
-                        node = lotNode
-                    })
                 end
             end
         end
@@ -227,10 +239,71 @@ function PropertyModule.Init(Context, PROPERTIES)
     })
 
     ----------------------------------------------------------------------------
-    -- BUTTON DEBUG
+    -- BUTTON DEBUG & EARN CHECK
     ----------------------------------------------------------------------------
     MainTab:CreateButton({
-        Title = "🔍 Debug Property Info (Check F9)",
+        Title = "📉 Check Lowest Earn Property",
+        Callback = function()
+            local cash = GetCurrentCash()
+            local ownedList, _ = GetStreetLotsState()
+
+            if #ownedList == 0 then
+                QueueNotify({
+                    Title = "Earn Check Result",
+                    Content = "Tidak ada property yang dimiliki saat ini.",
+                    Duration = 4
+                })
+                return
+            end
+
+            local lowest = nil
+            for _, t in ipairs(ownedList) do
+                if t.earn >= 0 then
+                    if not lowest or t.earn < lowest.earn then
+                        lowest = t
+                    end
+                end
+            end
+
+            local best = GetBestAffordableProperty(cash, State.Level)
+            local propName = lowest.id and (PROPERTIES_BY_ID[lowest.id] and PROPERTIES_BY_ID[lowest.id].name or lowest.id) or "Unknown"
+
+            print("==================================================")
+            print("[LOWEST EARN CHECK]")
+            print(string.format("Lowest Property : Lot_%d (%s)", lowest.lotNumber, propName))
+            print(string.format("Current Earn    : $%s/hr", FormatMoneyShort(lowest.earn)))
+            print("Current Cash    :", "$" .. FormatMoneyShort(cash))
+            
+            if best then
+                local bestIncome = GetEffectiveIncome(best)
+                print(string.format("Best Buyable    : %s ($%s/hr) - Cost: $%s", best.name, FormatMoneyShort(bestIncome), FormatMoneyShort(best.baseCost)))
+                if bestIncome > lowest.earn then
+                    print("Status          : READY TO UPGRADE (Property Baru Lebih Untung!)")
+                else
+                    print("Status          : WAITING (Cash cukup tapi property terbaik belum lebih untung dari lowest saat ini)")
+                end
+            else
+                print("Status          : CANNOT AFFORD (Cash tidak cukup untuk upgrade)")
+            end
+            print("==================================================")
+
+            local statusMsg = "Lot " .. lowest.lotNumber .. " (" .. propName .. ") - $" .. FormatMoneyShort(lowest.earn) .. "/hr"
+            if best and GetEffectiveIncome(best) > lowest.earn then
+                statusMsg = statusMsg .. "\nBisa Upgrade ke: " .. best.name
+            else
+                statusMsg = statusMsg .. "\nBelum ada upgrade yang lebih tinggi."
+            end
+
+            QueueNotify({
+                Title = "Lowest Earn Property Detected",
+                Content = statusMsg,
+                Duration = 5
+            })
+        end
+    })
+
+    MainTab:CreateButton({
+        Title = "🔍 Debug Full Property Info (F9)",
         Callback = function()
             local cash = GetCurrentCash()
             local owned, max = GetPropsCapInfo()
@@ -238,13 +311,13 @@ function PropertyModule.Init(Context, PROPERTIES)
             local best = GetBestAffordableProperty(cash, State.Level)
 
             print("==================================================")
-            print("[PROPERTY DEBUG LOG]")
+            print("[FULL PROPERTY DEBUG LOG]")
             print("--------------------------------------------------")
             print("Current Cash :", "$" .. FormatMoneyShort(cash), "(" .. cash .. ")")
             print("Player Level :", State.Level)
             print("Property Cap :", owned .. " / " .. max)
             print("--------------------------------------------------")
-            print("EMPTY LOTS (" .. #emptyLotNumbers .. "):", table.concat(emptyLotNumbers, ", "))
+            print("UNLOCKED EMPTY LOTS (" .. #emptyLotNumbers .. "):", table.concat(emptyLotNumbers, ", "))
             print("--------------------------------------------------")
             print("OWNED LOTS (" .. #ownedList .. "):")
             for _, item in ipairs(ownedList) do
@@ -264,7 +337,7 @@ function PropertyModule.Init(Context, PROPERTIES)
 
             QueueNotify({
                 Title = "Debug Dumped to Console",
-                Content = "Cek F9 Developer Console untuk detailnya.",
+                Content = "Cek F9 Developer Console untuk detail lengkap.",
                 Duration = 4
             })
         end
@@ -308,6 +381,7 @@ function PropertyModule.Init(Context, PROPERTIES)
         local ownedList, _ = GetStreetLotsState()
         if #ownedList == 0 then return end
 
+        -- Cari Lot dengan Earn paling rendah (Lowest Income)
         local lowest = nil
         for _, t in ipairs(ownedList) do
             if t.earn >= 0 then
@@ -317,17 +391,21 @@ function PropertyModule.Init(Context, PROPERTIES)
             end
         end
 
-        if not lowest or not lowest.id then return end
+        if not lowest then return end
 
         local cash = GetCurrentCash()
         local best = GetBestAffordableProperty(cash, State.Level)
 
         if not best then return end
-        if best.id == lowest.id then return end
+        if lowest.id and best.id == lowest.id then return end
+        
+        -- Cek apakah pendapatan property baru LEBIH TINGGI daripada earn lot terlemah saat ini
         if GetEffectiveIncome(best) <= lowest.earn then return end
 
         local targetLotNumber = lowest.lotNumber
-        local delSuccess = TryDeleteProperty(lowest.id, targetLotNumber)
+        
+        -- Hapus/Jual property terlemah lebih dulu
+        local delSuccess = TryDeleteProperty(lowest.id or "", targetLotNumber)
 
         if delSuccess then
             task.wait(0.6)
@@ -341,24 +419,25 @@ function PropertyModule.Init(Context, PROPERTIES)
             if buySuccess then
                 QueueNotify({
                     Title = "Property Upgraded!",
-                    Content = "Diganti ke: " .. targetToBuy.name .. " [Lot " .. targetLotNumber .. "]",
+                    Content = "Lot " .. targetLotNumber .. " diganti ke: " .. targetToBuy.name,
                     Duration = 3
                 })
             else
-                local oldPropInfo = PROPERTIES_BY_ID[lowest.id]
+                -- Rollback jika gagal beli
+                local oldPropInfo = lowest.id and PROPERTIES_BY_ID[lowest.id]
                 if oldPropInfo then
                     task.wait(0.5)
                     local rebuySuccess = TryBuyProperty(oldPropInfo.id, targetLotNumber)
                     if rebuySuccess then
                         QueueNotify({
                             Title = "Upgrade Gagal - Rollback",
-                            Content = "Gagal beli property baru, berhasil rebuy: " .. oldPropInfo.name,
+                            Content = "Gagal beli baru, berhasil rebuy: " .. oldPropInfo.name,
                             Duration = 4
                         })
                     else
                         QueueNotify({
                             Title = "Upgrade Gagal!",
-                            Content = "Slot kosong, gagal beli property baru maupun rollback. Cek cash secara manual.",
+                            Content = "Slot " .. targetLotNumber .. " kosong, gagal beli/rollback.",
                             Duration = 5
                         })
                     end
@@ -388,11 +467,11 @@ function PropertyModule.Init(Context, PROPERTIES)
         local propInfo = PROPERTIES_BY_ID[SelectedPropertyId]
         if not propInfo then return end
 
-        if wrongTile and wrongTile.id then
+        if wrongTile then
             local cash = GetCurrentCash()
             if cash >= propInfo.baseCost and State.Level >= propInfo.level then
                 local targetLot = wrongTile.lotNumber
-                local delSuccess = TryDeleteProperty(wrongTile.id, targetLot)
+                local delSuccess = TryDeleteProperty(wrongTile.id or "", targetLot)
                 if delSuccess then
                     task.wait(0.6)
 
