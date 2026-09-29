@@ -24,13 +24,24 @@ function PropertyModule.Init(Context, PROPERTIES)
     local PropertyNamesList = {}
     local PropertyMap = {}
     local PROPERTIES_BY_ID = {}
+    local PROPERTIES_LOWER = {} -- {id=..., lowerName=...} precomputed sekali saja
 
     for _, prop in ipairs(PROPERTIES) do
         local displayName = "[Lv." .. prop.level .. "] " .. prop.name .. " ($" .. FormatMoneyShort(prop.baseCost) .. ")"
         table.insert(PropertyNamesList, displayName)
         PropertyMap[displayName] = prop.id
         PROPERTIES_BY_ID[prop.id] = prop
+        table.insert(PROPERTIES_LOWER, { id = prop.id, lowerName = string.lower(prop.name) })
     end
+
+    ----------------------------------------------------------------------------
+    -- CONSTANT TABLES (hoisted, biar ga alokasi ulang tiap call -> kurangi GC)
+    ----------------------------------------------------------------------------
+    local PROPERTY_ID_ATTRS = {"PropertyId", "PropId", "id", "ID"}
+
+    -- Cache hasil deteksi Property ID per Lot Node.
+    -- weak-keys supaya kalau Instance-nya destroyed, cache auto ke-GC.
+    local LotPropertyCache = setmetatable({}, { __mode = "k" })
 
     local function GetCurrentCash()
         local node = SafeFindPath(CashPath)
@@ -39,7 +50,6 @@ function PropertyModule.Init(Context, PROPERTIES)
         return ParseAbbreviatedNumber(raw)
     end
 
-    -- Membaca slot owned / cap (misal: "10/14") dari Summary.Lots.Value
     local function GetPropsCapInfo()
         local node = SafeFindPath(SummaryLotsPath)
         if not node then return 0, 0 end
@@ -49,55 +59,122 @@ function PropertyModule.Init(Context, PROPERTIES)
         return tonumber(owned) or 0, tonumber(max) or 0
     end
 
-    -- Mengambil nomor Lot dari nama (contoh "Lot_8" -> 8)
     local function ExtractLotNumber(lotName)
         return tonumber(string.match(lotName, "^Lot_(%d+)$"))
     end
 
-    -- Fungsi pembantu untuk mendeteksi Property ID dari sebuah Node Lot
+    local function IsLotLocked(lotNode)
+        local lockedNode = lotNode:FindFirstChild("Locked")
+        return lockedNode ~= nil and (
+            (lockedNode:IsA("GuiObject") and lockedNode.Visible == true) or
+            (not lockedNode:IsA("GuiObject"))
+        )
+    end
+
+    local function IsLotForSale(lotNode)
+        local forSaleNode = lotNode:FindFirstChild("ForSale")
+        return forSaleNode ~= nil and (
+            (forSaleNode:IsA("GuiObject") and forSaleNode.Visible == true) or
+            forSaleNode:FindFirstChild("Plus") ~= nil
+        )
+    end
+
+    ----------------------------------------------------------------------------
+    -- DETEKSI PROPERTY ID DARI LOT (DIOPTIMASI + DI-CACHE)
+    ----------------------------------------------------------------------------
+    -- Step 2 & 3 lama (loop PROPERTIES_BY_ID x FindFirstChild) diganti jadi
+    -- 1x GetChildren() + hash lookup -> O(children) bukan O(properties).
+    -- Step 4 (GetDescendants + string search) HANYA fallback terakhir,
+    -- dan hasilnya di-cache supaya tidak diulang tiap scan.
     local function DetectPropertyIdFromLot(lotNode)
-        -- 1. Cek dari Attribute jika ada
-        for _, attr in ipairs({"PropertyId", "PropId", "id", "ID"}) do
+        local cached = LotPropertyCache[lotNode]
+        if cached ~= nil then
+            return cached
+        end
+
+        local result = nil
+
+        -- 1. Attribute check
+        for _, attr in ipairs(PROPERTY_ID_ATTRS) do
             local val = lotNode:GetAttribute(attr)
             if val and PROPERTIES_BY_ID[val] then
-                return val
+                result = val
+                break
             end
         end
 
-        -- 2. Cek apakah ada child bernama propId
-        for propId, _ in pairs(PROPERTIES_BY_ID) do
-            if lotNode:FindFirstChild(propId) then
-                return propId
-            end
-        end
-
-        -- 3. Cek nama child / tile
-        for _, child in ipairs(lotNode:GetChildren()) do
-            if PROPERTIES_BY_ID[child.Name] then
-                return child.Name
-            end
-            local matchedId = string.match(child.Name, "^Tile_(.+)$") or string.match(child.Name, "^Prop_(.+)$")
-            if matchedId and PROPERTIES_BY_ID[matchedId] then
-                return matchedId
-            end
-        end
-
-        -- 4. Cek TextLabel di dalam Lot yang mencocokkan nama Property
-        for _, child in ipairs(lotNode:GetDescendants()) do
-            if child:IsA("TextLabel") or child:IsA("TextBox") then
-                local text = child.Text
-                for propId, propObj in pairs(PROPERTIES_BY_ID) do
-                    if string.find(string.lower(text), string.lower(propObj.name), 1, true) then
-                        return propId
-                    end
+        -- 2. Nama child langsung (gabungan step lama 2 & 3, hash lookup O(1))
+        if not result then
+            for _, child in ipairs(lotNode:GetChildren()) do
+                local name = child.Name
+                if PROPERTIES_BY_ID[name] then
+                    result = name
+                    break
+                end
+                local matchedId = string.match(name, "^Tile_(.+)$") or string.match(name, "^Prop_(.+)$")
+                if matchedId and PROPERTIES_BY_ID[matchedId] then
+                    result = matchedId
+                    break
                 end
             end
         end
 
-        return nil
+        -- 3. Fallback berat: scan text descendant (hanya kalau benar2 perlu)
+        if not result then
+            for _, child in ipairs(lotNode:GetDescendants()) do
+                if child:IsA("TextLabel") or child:IsA("TextBox") then
+                    local text = string.lower(child.Text)
+                    for _, entry in ipairs(PROPERTIES_LOWER) do
+                        if string.find(text, entry.lowerName, 1, true) then
+                            result = entry.id
+                            break
+                        end
+                    end
+                    if result then break end
+                end
+            end
+        end
+
+        -- Hanya cache hasil POSITIF. Kalau nil, jangan di-cache
+        -- (UI mungkin belum fully rendered, biar bisa re-detect nanti).
+        if result then
+            LotPropertyCache[lotNode] = result
+        end
+
+        return result
     end
 
-    -- Mengambil daftar Lot yang dimiliki & Lot yang kosong (Mengabaikan Lot yang LOCKED)
+    local function InvalidateLotCache(lotNode)
+        if lotNode then
+            LotPropertyCache[lotNode] = nil
+        end
+    end
+
+    ----------------------------------------------------------------------------
+    -- SCAN RINGAN: hanya ambil empty lot number, TANPA detect property (murah)
+    -- Dipakai di loop pembelian supaya tidak trigger DetectPropertyIdFromLot
+    -- untuk lot yang sudah owned & tidak relevan.
+    ----------------------------------------------------------------------------
+    local function GetEmptyLotNumbers()
+        local streetNode = SafeFindPath(StreetPath)
+        if not streetNode then return {} end
+
+        local emptyLotNumbers = {}
+        for _, lotNode in ipairs(streetNode:GetChildren()) do
+            local lotNum = ExtractLotNumber(lotNode.Name)
+            if lotNum and not IsLotLocked(lotNode) and IsLotForSale(lotNode) then
+                table.insert(emptyLotNumbers, lotNum)
+            end
+        end
+
+        table.sort(emptyLotNumbers)
+        return emptyLotNumbers
+    end
+
+    ----------------------------------------------------------------------------
+    -- SCAN PENUH (owned + empty) - dipakai saat memang butuh info property owned
+    -- (upgrade weakest, manual wrongTile check, debug). Dipanggil MAX 1x/cycle.
+    ----------------------------------------------------------------------------
     local function GetStreetLotsState()
         local streetNode = SafeFindPath(StreetPath)
         if not streetNode then return {}, {} end
@@ -108,31 +185,16 @@ function PropertyModule.Init(Context, PROPERTIES)
         for _, lotNode in ipairs(streetNode:GetChildren()) do
             local lotNum = ExtractLotNumber(lotNode.Name)
             if lotNum then
-                -- 1. CEK APAKAH LOT DALAM KEADAAN LOCKED (Jika locked, abaikan total)
-                local lockedNode = lotNode:FindFirstChild("Locked")
-                local isLocked = lockedNode and (
-                    (lockedNode:IsA("GuiObject") and lockedNode.Visible == true) or
-                    (not lockedNode:IsA("GuiObject"))
-                )
-
-                if not isLocked then
-                    -- 2. CEK APAKAH LOT KOSONG (ForSale.Plus ada / ForSale Visible)
-                    local forSaleNode = lotNode:FindFirstChild("ForSale")
-                    local isForSale = forSaleNode and (
-                        (forSaleNode:IsA("GuiObject") and forSaleNode.Visible == true) or
-                        forSaleNode:FindFirstChild("Plus") ~= nil
-                    )
-
-                    if isForSale then
+                if not IsLotLocked(lotNode) then
+                    if IsLotForSale(lotNode) then
                         table.insert(emptyLotNumbers, lotNum)
                     else
-                        -- 3. LOT TERISI (OWNED)
-                        local chipLabel = lotNode:FindFirstChild("Chip") and lotNode.Chip:FindFirstChild("Label")
+                        local chip = lotNode:FindFirstChild("Chip")
+                        local chipLabel = chip and chip:FindFirstChild("Label")
                         local earnValue = 0
 
                         if chipLabel then
                             local rawText = GetRawTextFromNode(chipLabel)
-                            -- Format teks misal "$12.09M/hr" -> "12.09M"
                             local cleanText = string.gsub(tostring(rawText), "[%$%s/hrHRhH]", "")
                             earnValue = ParseAbbreviatedNumber(cleanText)
                         end
@@ -172,7 +234,6 @@ function PropertyModule.Init(Context, PROPERTIES)
         return 0
     end
 
-    -- Remote Invoke Buy dengan Parameter Lot Number
     local function TryBuyProperty(propId, lotNumber)
         local success, result = pcall(function()
             return BuyPropertyRemote:InvokeServer(PROPERTY_HASH, propId, lotNumber)
@@ -183,7 +244,6 @@ function PropertyModule.Init(Context, PROPERTIES)
         return false, nil
     end
 
-    -- Remote Invoke Delete dengan Parameter Lot Number
     local function TryDeleteProperty(propId, lotNumber)
         local success, result = pcall(function()
             return DeletePropertyRemote:InvokeServer(PROPERTY_HASH, propId, lotNumber)
@@ -239,7 +299,7 @@ function PropertyModule.Init(Context, PROPERTIES)
     })
 
     ----------------------------------------------------------------------------
-    -- BUTTON DEBUG & EARN CHECK
+    -- BUTTON DEBUG & EARN CHECK (dipakai user manual, tidak perlu dioptimasi ekstrem)
     ----------------------------------------------------------------------------
     MainTab:CreateButton({
         Title = "📉 Check Lowest Earn Property",
@@ -273,7 +333,7 @@ function PropertyModule.Init(Context, PROPERTIES)
             print(string.format("Lowest Property : Lot_%d (%s)", lowest.lotNumber, propName))
             print(string.format("Current Earn    : $%s/hr", FormatMoneyShort(lowest.earn)))
             print("Current Cash    :", "$" .. FormatMoneyShort(cash))
-            
+
             if best then
                 local bestIncome = GetEffectiveIncome(best)
                 print(string.format("Best Buyable    : %s ($%s/hr) - Cost: $%s", best.name, FormatMoneyShort(bestIncome), FormatMoneyShort(best.baseCost)))
@@ -344,18 +404,18 @@ function PropertyModule.Init(Context, PROPERTIES)
     })
     ----------------------------------------------------------------------------
 
-    -- Mengisi Lot yang kosong secara otomatis
-    local function RunAutoFillEmptySlots()
+    -- OPTIMIZED: hanya 1x scan street (GetEmptyLotNumbers, ringan),
+    -- sisanya update index lokal & increment counter manual (tanpa rescan).
+    local function RunAutoFillEmptySlots(curOwned, curMax)
         local MAX_BUY_PER_CYCLE = 15
+        local emptyLotNumbers = GetEmptyLotNumbers()
+        local idx = 1
 
-        for i = 1, MAX_BUY_PER_CYCLE do
-            local curOwned, curMax = GetPropsCapInfo()
-            if curMax == 0 or curOwned >= curMax then break end
+        for _ = 1, MAX_BUY_PER_CYCLE do
+            if curOwned >= curMax then break end
+            if idx > #emptyLotNumbers then break end
 
-            local _, emptyLotNumbers = GetStreetLotsState()
-            if #emptyLotNumbers == 0 then break end
-
-            local targetLot = emptyLotNumbers[1]
+            local targetLot = emptyLotNumbers[idx]
             local cash = GetCurrentCash()
             local best = GetBestAffordableProperty(cash, State.Level)
 
@@ -364,6 +424,9 @@ function PropertyModule.Init(Context, PROPERTIES)
             local success = TryBuyProperty(best.id, targetLot)
 
             if success then
+                curOwned = curOwned + 1
+                idx = idx + 1
+
                 QueueNotify({
                     Title = "Property Bought!",
                     Content = best.name .. " [Lot " .. targetLot .. "] ($" .. FormatMoneyShort(best.baseCost) .. ")",
@@ -381,7 +444,6 @@ function PropertyModule.Init(Context, PROPERTIES)
         local ownedList, _ = GetStreetLotsState()
         if #ownedList == 0 then return end
 
-        -- Cari Lot dengan Earn paling rendah (Lowest Income)
         local lowest = nil
         for _, t in ipairs(ownedList) do
             if t.earn >= 0 then
@@ -398,16 +460,13 @@ function PropertyModule.Init(Context, PROPERTIES)
 
         if not best then return end
         if lowest.id and best.id == lowest.id then return end
-        
-        -- Cek apakah pendapatan property baru LEBIH TINGGI daripada earn lot terlemah saat ini
         if GetEffectiveIncome(best) <= lowest.earn then return end
 
         local targetLotNumber = lowest.lotNumber
-        
-        -- Hapus/Jual property terlemah lebih dulu
         local delSuccess = TryDeleteProperty(lowest.id or "", targetLotNumber)
 
         if delSuccess then
+            InvalidateLotCache(lowest.node) -- WAJIB: property di lot ini berubah
             task.wait(0.6)
 
             local postDeleteCash = GetCurrentCash()
@@ -423,7 +482,6 @@ function PropertyModule.Init(Context, PROPERTIES)
                     Duration = 3
                 })
             else
-                -- Rollback jika gagal beli
                 local oldPropInfo = lowest.id and PROPERTIES_BY_ID[lowest.id]
                 if oldPropInfo then
                     task.wait(0.5)
@@ -446,9 +504,8 @@ function PropertyModule.Init(Context, PROPERTIES)
         end
     end
 
-    -- Mode Manual Select
-    local function RunManualPropertyMode()
-        local owned, max = GetPropsCapInfo()
+    -- Mode Manual Select (OPTIMIZED: satu kali full scan, loop pakai index lokal)
+    local function RunManualPropertyMode(owned, max)
         if max == 0 then return end
 
         local ownedList, emptyLotNumbers = GetStreetLotsState()
@@ -473,6 +530,7 @@ function PropertyModule.Init(Context, PROPERTIES)
                 local targetLot = wrongTile.lotNumber
                 local delSuccess = TryDeleteProperty(wrongTile.id or "", targetLot)
                 if delSuccess then
+                    InvalidateLotCache(wrongTile.node) -- WAJIB
                     task.wait(0.6)
 
                     local postDeleteCash = GetCurrentCash()
@@ -496,14 +554,14 @@ function PropertyModule.Init(Context, PROPERTIES)
             end
         elseif #emptyLotNumbers > 0 then
             local MAX_BUY_PER_CYCLE = 15
-            for i = 1, MAX_BUY_PER_CYCLE do
-                local curOwned, curMax = GetPropsCapInfo()
-                if curOwned >= curMax then break end
+            local idx = 1
+            local curOwned = owned
 
-                local _, currentEmptyLots = GetStreetLotsState()
-                if #currentEmptyLots == 0 then break end
+            for _ = 1, MAX_BUY_PER_CYCLE do
+                if curOwned >= max then break end
+                if idx > #emptyLotNumbers then break end
 
-                local targetLot = currentEmptyLots[1]
+                local targetLot = emptyLotNumbers[idx]
                 local cash = GetCurrentCash()
                 if cash < propInfo.baseCost or State.Level < propInfo.level then
                     break
@@ -511,6 +569,8 @@ function PropertyModule.Init(Context, PROPERTIES)
 
                 local success = TryBuyProperty(SelectedPropertyId, targetLot)
                 if success then
+                    curOwned = curOwned + 1
+                    idx = idx + 1
                     QueueNotify({
                         Title = "Property Bought!",
                         Content = propInfo.name .. " [Lot " .. targetLot .. "]",
@@ -541,12 +601,12 @@ function PropertyModule.Init(Context, PROPERTIES)
 
         if AutoHighestPropertyMode then
             if owned < max then
-                RunAutoFillEmptySlots()
+                RunAutoFillEmptySlots(owned, max)
             else
                 RunAutoUpgradeWeakest()
             end
         else
-            RunManualPropertyMode()
+            RunManualPropertyMode(owned, max)
         end
     end)
 end
