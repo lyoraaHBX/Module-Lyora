@@ -226,6 +226,51 @@ function PropertyModule.Init(Context, PROPERTIES)
         end
     })
 
+    ----------------------------------------------------------------------------
+    -- BUTTON DEBUG
+    ----------------------------------------------------------------------------
+    MainTab:CreateButton({
+        Title = "🔍 Debug Property Info (Check F9)",
+        Callback = function()
+            local cash = GetCurrentCash()
+            local owned, max = GetPropsCapInfo()
+            local ownedList, emptyLotNumbers = GetStreetLotsState()
+            local best = GetBestAffordableProperty(cash, State.Level)
+
+            print("==================================================")
+            print("[PROPERTY DEBUG LOG]")
+            print("--------------------------------------------------")
+            print("Current Cash :", "$" .. FormatMoneyShort(cash), "(" .. cash .. ")")
+            print("Player Level :", State.Level)
+            print("Property Cap :", owned .. " / " .. max)
+            print("--------------------------------------------------")
+            print("EMPTY LOTS (" .. #emptyLotNumbers .. "):", table.concat(emptyLotNumbers, ", "))
+            print("--------------------------------------------------")
+            print("OWNED LOTS (" .. #ownedList .. "):")
+            for _, item in ipairs(ownedList) do
+                local propName = item.id and (PROPERTIES_BY_ID[item.id] and PROPERTIES_BY_ID[item.id].name or item.id) or "UNKNOWN ID"
+                print(string.format("  • Lot_%d | Prop: %s | Earn/hr: $%s", item.lotNumber, propName, FormatMoneyShort(item.earn)))
+            end
+            print("--------------------------------------------------")
+            print("BEST AFFORDABLE PROPERTY:")
+            if best then
+                print("  • Name : " .. best.name)
+                print("  • ID   : " .. best.id)
+                print("  • Cost : $" .. FormatMoneyShort(best.baseCost))
+            else
+                print("  • None (Insufficient Cash or Level)")
+            end
+            print("==================================================")
+
+            QueueNotify({
+                Title = "Debug Dumped to Console",
+                Content = "Cek F9 Developer Console untuk detailnya.",
+                Duration = 4
+            })
+        end
+    })
+    ----------------------------------------------------------------------------
+
     -- Mengisi Lot yang kosong secara otomatis
     local function RunAutoFillEmptySlots()
         local MAX_BUY_PER_CYCLE = 15
