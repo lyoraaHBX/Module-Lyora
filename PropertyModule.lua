@@ -2,7 +2,7 @@ local PropertyModule = {}
 
 function PropertyModule.Init(Context, PROPERTIES)
     local ReplicatedStorage = Context.ReplicatedStorage
-    local MainTab = Context.MainTab   -- diubah dari Context.PropertyTab
+    local MainTab = Context.MainTab
     local Scheduler = Context.Scheduler
     local QueueNotify = Context.QueueNotify
     local ForceSetToggleOff = Context.ForceSetToggleOff
@@ -18,10 +18,10 @@ function PropertyModule.Init(Context, PROPERTIES)
 
     local CashPath = {"PlayerGui", "MafiaWarsUI", "Root", "TopBar", "CashCluster", "CashValue"}
 
-    -- Path X/Y slot cap (Summary.Lots.Value.ContentText)
+    -- REQ 3: Slot Cap X/Y -> Scroller.Summary.Lots.Value.ContentText (contoh: "10/14")
     local PropsLotsCapPath = {"PlayerGui", "MafiaWarsUI", "Root", "Content", "PropsPanel", "Scroller", "Summary", "Lots", "Value", "ContentText"}
 
-    -- Path dasar untuk semua slot Lot_N (tinggal tambah Lot_{index} + child sesuai kebutuhan)
+    -- Base path untuk semua slot Lot_N (dipakai untuk REQ 1 & REQ 2)
     local PropsLotsBasePath = {"PlayerGui", "MafiaWarsUI", "Root", "Content", "PropsPanel", "Scroller", "YourBlock", "Street"}
 
     local PropertyNamesList = {}
@@ -35,7 +35,8 @@ function PropertyModule.Init(Context, PROPERTIES)
         PROPERTIES_BY_ID[prop.id] = prop
     end
 
-    -- Cache slot -> propId, dilacak manual dari hasil buy/delete yang dilakukan SCRIPT INI SENDIRI.
+    -- Cache slot -> propId, dilacak dari hasil buy/delete script sendiri
+    -- (struktur GUI baru tidak menyediakan info "id property" di slot, hanya status kosong & earn)
     local SlotOwnershipCache = {}
 
     local function GetCurrentCash()
@@ -45,6 +46,7 @@ function PropertyModule.Init(Context, PROPERTIES)
         return ParseAbbreviatedNumber(raw)
     end
 
+    -- REQ 3: Baca X/Y dari Summary.Lots.Value.ContentText
     local function GetPropsCapInfo()
         local node = SafeFindPath(PropsLotsCapPath)
         if not node then return 0, 0 end
@@ -54,7 +56,7 @@ function PropertyModule.Init(Context, PROPERTIES)
         return tonumber(owned) or 0, tonumber(max) or 0
     end
 
-    -- Cek apakah slot Lot_{index} kosong via keberadaan ForSale.Plus
+    -- REQ 2: Cek slot kosong via keberadaan Lot_{index}.ForSale.Plus
     local function IsSlotEmpty(slotIndex)
         local path = {}
         for _, p in ipairs(PropsLotsBasePath) do table.insert(path, p) end
@@ -63,10 +65,10 @@ function PropertyModule.Init(Context, PROPERTIES)
         table.insert(path, "Plus")
 
         local node = SafeFindPath(path)
-        return node ~= nil
+        return node ~= nil  -- ADA node ForSale.Plus = slot KOSONG
     end
 
-    -- Baca earn value slot Lot_{index} via Chip.Label.ContentText, format contoh "$12.09M/hr"
+    -- REQ 1: Baca earn dari Lot_{index}.Chip.Label.ContentText, contoh "$12.09M/hr"
     local function GetEarnForSlot(slotIndex)
         local path = {}
         for _, p in ipairs(PropsLotsBasePath) do table.insert(path, p) end
@@ -81,11 +83,12 @@ function PropertyModule.Init(Context, PROPERTIES)
         local raw = GetRawTextFromNode(node)
         if not raw then return 0 end
 
+        -- Buang suffix "/hr" sebelum parsing jadi angka (misal "$12.09M/hr" -> "$12.09M")
         local cleaned = tostring(raw):gsub("/hr", "")
         return ParseAbbreviatedNumber(cleaned) or 0
     end
 
-    -- Scan semua slot 1..maxSlots, kembalikan list slot yang TERISI beserta earn & id (cache, bisa nil)
+    -- Scan semua slot 1..maxSlots, kembalikan list slot TERISI beserta earn & id (cache, bisa nil)
     local function GetOwnedPropertiesList()
         local _, maxSlots = GetPropsCapInfo()
         local list = {}
@@ -103,7 +106,7 @@ function PropertyModule.Init(Context, PROPERTIES)
         return list
     end
 
-    -- Cari index slot kosong pertama (1..maxSlots) via cek ForSale.Plus langsung ke GUI
+    -- REQ 2: Cari index slot kosong pertama (dipakai untuk isi slot dengan buy)
     local function FindNextEmptySlotIndex(maxSlots)
         for i = 1, maxSlots do
             if IsSlotEmpty(i) then
@@ -158,7 +161,7 @@ function PropertyModule.Init(Context, PROPERTIES)
     local SelectedPropertyId = PROPERTIES[1].id
     local AutoPropertyToggleRef = nil
 
-    MainTab:CreateSection("Auto Property")   -- diubah dari PropertyTab
+    MainTab:CreateSection("Auto Property")
 
     AutoPropertyToggleRef = MainTab:CreateToggle({
         Title = "Enable Auto Property",
@@ -197,6 +200,7 @@ function PropertyModule.Init(Context, PROPERTIES)
         end
     })
 
+    -- REQ 2 dalam aksi: cari slot kosong -> isi dengan buy
     local function RunAutoFillEmptySlots()
         local MAX_BUY_PER_CYCLE = 15
 
@@ -235,6 +239,7 @@ function PropertyModule.Init(Context, PROPERTIES)
         end
     end
 
+    -- REQ 1 dalam aksi: cari earn TERLEMAH, bandingkan dengan cash untuk cari pengganti
     local function RunAutoUpgradeWeakest()
         local ownedList = GetOwnedPropertiesList()
         if #ownedList == 0 then return end
